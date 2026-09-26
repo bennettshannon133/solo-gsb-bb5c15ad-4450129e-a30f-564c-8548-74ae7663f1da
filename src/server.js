@@ -19,7 +19,8 @@ const {
   MAX_TOTAL_GEARS,
 } = require('./procure');
 const { planDualSpeed, MIN_GEARS: MIN_DUAL_GEARS } = require('./dual');
-const { planTorque, validateTorqueGears, parsePositiveInt, MAX_TORQUE } = require('./torque');
+const { validateTorqueGears, parsePositiveInt, MAX_TORQUE } = require('./torque');
+const { TorqueComputeQueue, MAX_WAITING: MAX_TORQUE_WAITING } = require('./torque-queue');
 const {
   planLayout,
   parseAxes,
@@ -60,6 +61,9 @@ const {
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+
+/** 带载计算调度器：完整枚举与级序校核在独立 worker 线程中执行，主线程不被阻塞 */
+const torqueQueue = new TorqueComputeQueue();
 
 app.use(express.json({ limit: '64kb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -527,7 +531,7 @@ app.post('/api/dual-speed', (req, res) => {
   });
 });
 
-app.post('/api/torque', (req, res) => {
+app.post('/api/torque', async (req, res) => {
   const body = req.body || {};
 
   const target = parseTarget(String(body.target ?? ''));
@@ -547,8 +551,29 @@ app.post('/api/torque', (req, res) => {
   const checked = validateTorqueGears(body.gears);
   if (!checked.ok) return res.status(400).json({ error: checked.error });
 
-  // 完整枚举速比配对组后，对每组配对的全部级次顺序分别做扭矩校核（不截断）
-  const plan = planTorque(checked.gears, target, tolerance, inputTorque);
+  // 完整枚举速比配对组与全部级次顺序的扭矩校核（不截断）在独立计算线程中执行，
+  // 主线程继续响应页面与其他 API；请求按到达顺序逐个计算，最多 2 个排队等待
+  const submitted = torqueQueue.submit({
+    gears: checked.gears,
+    target,
+    tolerance,
+    inputTorque,
+  });
+  if (!submitted.accepted) {
+    return res.status(503).json({
+      error:
+        `带载计算繁忙：当前已有 1 个计算在执行、${MAX_TORQUE_WAITING} 个请求排队等待，` +
+        '请稍后重试',
+    });
+  }
+
+  let plan;
+  try {
+    plan = await submitted.result;
+  } catch (err) {
+    // 计算线程异常（含线程崩溃重建）只让当前请求失败，队列中其余请求不受影响
+    return res.status(500).json({ error: `带载计算失败：${err.message}` });
+  }
 
   const base = {
     target: serializeFrac(target),
