@@ -19,7 +19,7 @@ const {
   MAX_TOTAL_GEARS,
 } = require('./procure');
 const { planDualSpeed, MIN_GEARS: MIN_DUAL_GEARS } = require('./dual');
-const { planTorque, validateTorqueGears, parsePositiveInt, MAX_TORQUE } = require('./torque');
+const { validateTorqueGears, parsePositiveInt, MAX_TORQUE } = require('./torque');
 const {
   planLayout,
   parseAxes,
@@ -57,9 +57,17 @@ const {
   planReciprocate,
   MAX_SEGMENTS,
 } = require('./reciprocate');
+const { TorqueWorkerPool } = require('./torque-pool');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+
+/**
+ * 带载安全选配专用计算线程（worker_threads）：
+ * 完整速比枚举 + 全部级次顺序的扭矩校核在独立线程串行执行，
+ * 主线程继续响应页面与其他 API；等待队列上限 2，满时立即返回 503。
+ */
+const torquePool = new TorqueWorkerPool();
 
 app.use(express.json({ limit: '64kb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
@@ -527,9 +535,11 @@ app.post('/api/dual-speed', (req, res) => {
   });
 });
 
-app.post('/api/torque', (req, res) => {
+app.post('/api/torque', async (req, res) => {
   const body = req.body || {};
 
+  // 输入校验仍在主线程完成（与原先完全一致），保证非法请求立即返回 400、
+  // 不占用计算线程的排队名额
   const target = parseTarget(String(body.target ?? ''));
   if (!target) {
     return res.status(400).json({ error: '目标输出转速比格式不正确：请输入正数（如 0.0833、1/12）' });
@@ -547,8 +557,32 @@ app.post('/api/torque', (req, res) => {
   const checked = validateTorqueGears(body.gears);
   if (!checked.ok) return res.status(400).json({ error: checked.error });
 
-  // 完整枚举速比配对组后，对每组配对的全部级次顺序分别做扭矩校核（不截断）
-  const plan = planTorque(checked.gears, target, tolerance, inputTorque);
+  // 完整速比枚举 + 全部级次顺序扭矩校核（不截断）交由独立计算线程，
+  // 按到达顺序串行执行；线程忙且等待队列已满（≥2 个等待）时立即返回 503
+  let plan;
+  try {
+    plan = await torquePool.submit({
+      gears: checked.gears,
+      target,
+      tolerance,
+      inputTorque,
+    });
+  } catch (err) {
+    if (err && err.code === 'TORQUE_BUSY') {
+      return res.status(503).json({
+        error: err.message,
+        code: 'TORQUE_BUSY',
+        retryable: true,
+        maxWaiting: torquePool.stats().maxWaiting,
+      });
+    }
+    // 计算线程异常退出：仅本次请求失败（线程已自动重建），不影响后续请求
+    return res.status(500).json({
+      error: err && err.message ? err.message : '带载选配计算失败，请稍后重试',
+      code: 'TORQUE_WORKER_ERROR',
+      retryable: true,
+    });
+  }
 
   const base = {
     target: serializeFrac(target),
